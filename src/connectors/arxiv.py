@@ -1,7 +1,6 @@
 import json
 import os
 from datetime import datetime
-from datasets import load_dataset
 
 import logging
 log = logging.getLogger(__name__)
@@ -57,6 +56,10 @@ class Arxiv :
                         if i >= number : break
         
         print(f"Path {self.hf_dataset}")
+        # Lazy import: loading HF datasets before torch breaks torch's DLL
+        # initialization on Windows, so it must not happen at module import.
+        from datasets import load_dataset
+
         # "json", data_files="my_file.json")
         dataset = load_dataset("json", data_files= self.hf_dataset)
         print(dataset.shape)
