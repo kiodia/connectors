@@ -20,6 +20,11 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# connectors.grounding only. It also needs the sibling local libraries
+# `vectorize` (embeddings + Qdrant access) and `matching_learning`
+# (fuzzy/vector duplicate detection), which are installed from the workspace
+# rather than from PyPI.
+grounding = ["qdrant-client>=1.7", "pydantic>=2"]
 
 [project.urls]
 Homepage = "https://github.com/kiodia/connectors"
