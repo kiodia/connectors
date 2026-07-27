@@ -16,7 +16,7 @@ import json
 from os.path import sep, isfile
 import logging as log
 
-from dotenv import load_dotenv
+from connectors.credentials import require_credential
 
 r'''
 classdocs
@@ -26,15 +26,11 @@ https://docs.microsoft.com/en-us/rest/api/cognitiveservices-bingsearch/bing-web-
     
 '''
 
-# Load the Bing subscription key from .env.
-load_dotenv()
-subscription_key = os.getenv("BING_SEARCH_KEY", "")
-assert subscription_key
 search_url = "https://api.cognitive.microsoft.com/bing/v7.0/search"
 #search_term = "Softcom technologies"
-headers = {"Ocp-Apim-Subscription-Key": subscription_key}
-      
-        
+
+
+
 def search(query): # pragma: no cover
     '''
     Search with Bing and returns  
@@ -51,11 +47,13 @@ def search(query): # pragma: no cover
     
     '''  
     
+    headers = {"Ocp-Apim-Subscription-Key": require_credential("BING_SEARCH_KEY")}
+
     params = {
-        "q": query, 
+        "q": query,
         'mkt': 'CH',
         'count' : '50'
-        } 
+        }
 
     r'''
     , 

@@ -26,14 +26,9 @@ import codecs
 from os.path import sep, isfile
 import logging as log
 
-from dotenv import load_dotenv
+from connectors.credentials import MissingCredential, require_credential
 
-# Load credentials from .env (api key + custom search engine id).
-load_dotenv()
-KEY = os.getenv("GOOGLE_CSE_KEY", "")
-CX = os.getenv("GOOGLE_CSE_CX", "")
-
-MAX_PATH =260 
+MAX_PATH =260
 
     
 def search(searchfor): # pragma: no cover
@@ -50,8 +45,13 @@ def search(searchfor): # pragma: no cover
         json results of the search
     
     '''
+    # Credentials (api key + custom search engine id) are read at call time so
+    # the .env of the calling application is found wherever it was started.
+    key = require_credential("GOOGLE_CSE_KEY")
+    cx = require_credential("GOOGLE_CSE_CX")
+
     query = urllib.parse.urlencode({'q': searchfor})
-    url = f'https://www.googleapis.com/customsearch/v1?key={KEY}&cx={CX}&{query}&gl=ch' 
+    url = f'https://www.googleapis.com/customsearch/v1?key={key}&cx={cx}&{query}&gl=ch'
     
     log.info(url)
     search_response = urllib.request.urlopen(url)
@@ -100,9 +100,13 @@ def retrieve_search(query,dest_dir): # pragma: no cover
                 file.close()
                 return results
             
+            except MissingCredential:
+                # a configuration problem: retrying it only wastes hours
+                raise
+
             except Exception as e:
                 # to pass Google throttling algorithm
-                log.info("Waiting : Error %s --> %s",60*wait_count,e) 
+                log.info("Waiting : Error %s --> %s",60*wait_count,e)
                 time.sleep(60*wait_count) # wait 4min, 8min, 16min, ...
                 wait_count *=2
                   

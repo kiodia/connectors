@@ -60,6 +60,29 @@ class CinemaMovie(BaseModel):
                     "movie's detail page; \"\" until filled in"
     )
 
+    def to_markdown(self) -> str:
+        """The movie as a self-contained markdown card: title heading,
+        poster image, then the synopsis.
+
+        The single rendering of a movie in MatchMake, used by both paths that
+        display one:
+
+        * :func:`to_item` — the live-listing CARD item the Newsroom shows in
+          a ``ShowCard`` dialog (and the Fribourg cinema demo asserts on);
+        * :class:`connectors.grounding.data_grounding.DataGrounding` — which
+          calls ``to_markdown()`` on any payload that defines it, so a movie
+          grounded as a Qdrant datapoint stores *exactly* this markdown and
+          the Newsroom renders a keopy-grounded movie identically to a
+          freshly scraped one.
+        """
+        lines = [f"# {self.title}", ""]
+        if self.poster_url:
+            lines.append(f"![{self.title}]({self.poster_url})")
+            lines.append("")
+        if self.description:
+            lines.append(self.description)
+        return "\n".join(lines)
+
 
 def parse_listing(markdown: str) -> List[CinemaMovie]:
     """Parse cinemotion.ch's Séances listing markdown into movies, in the
@@ -144,23 +167,19 @@ def to_item(movie: CinemaMovie):
 
     There is no Watch/desktop_markdown config backing this live listing (it
     is not a Qdrant collection), so ``item_text`` is a self-contained
-    markdown block — title heading, poster image, then the synopsis — which
-    is exactly what CardViewer falls back to rendering when it finds no
-    Watch config for the turn (see ``CardViewer._build_rendered_markdown``).
+    markdown block — :meth:`CinemaMovie.to_markdown`: title heading, poster
+    image, then the synopsis — which is exactly what CardViewer falls back
+    to rendering when it finds no Watch config for the turn (see
+    ``CardViewer._build_rendered_markdown``), and exactly what a grounded
+    movie datapoint stores.
     """
     from state.item import Item
     from state.watch import ViewerType
 
-    lines = [f"# {movie.title}", ""]
-    if movie.poster_url:
-        lines.append(f"![{movie.title}]({movie.poster_url})")
-        lines.append("")
-    if movie.description:
-        lines.append(movie.description)
     return Item(
         viewer_type=ViewerType.CARD,
         item_id=f"{uuid.uuid4()}",
-        item_text="\n".join(lines),
+        item_text=movie.to_markdown(),
         item_image_path=movie.poster_url,
         item_media_path=movie.detail_url,
         payload={

@@ -20,9 +20,17 @@ from connectors.grounding.data_grounding import (
     CREATED_AT, CREATED_TS, EXTERNAL_ID, MARKDOWN, PAYLOAD_TYPE, UPDATED_AT,
     UPDATED_TS, DataGrounding,
 )
+from connectors.grounding.entities import (
+    EXTRACTORS, WebDocument, entity_id, extract_entities, page_document,
+)
 
 __all__ = [
     "DataGrounding",
+    "extract_entities",
+    "entity_id",
+    "page_document",
+    "WebDocument",
+    "EXTRACTORS",
     "CREATED_AT",
     "UPDATED_AT",
     "CREATED_TS",

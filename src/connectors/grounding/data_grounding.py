@@ -86,7 +86,7 @@ from qdrant_client.models import (
 from matching_learning.matching.fuzzy import (
     DEFAULT_STRING_THRESHOLD, DEFAULT_VECTOR_THRESHOLD, best_string_match,
 )
-from vectorize.embeddings import AggregationModes, Embed, EmbeddingVector
+from vectorize.embeddings import AggregationModes, BatchEmbed, Embed, EmbeddingVector
 
 import logging
 log = logging.getLogger(__name__)
@@ -252,6 +252,7 @@ class DataGrounding:
         self.markdown_field = markdown_field or ""
         self.markdown_renderer = markdown_renderer
         self._embed: Optional[Embed] = None
+        self._batch_embed: Optional[BatchEmbed] = None
 
         log.info(
             "DataGrounding - collection '%s' grounded with embedding '%s' "
@@ -477,6 +478,68 @@ class DataGrounding:
                       self.collection_name, exc)
             return False
 
+    def purge_absent(self, keep_ids: Sequence[str],
+                     only_types: Optional[Sequence[str]] = None) -> int:
+        """Delete datapoints whose entity is no longer present in the source.
+
+        ``keep_ids`` is the set of identities (:func:`entity_id`) seen in the
+        FRESH scrape — typically ``{entity_id(e) for e in entities}``. Every
+        stored datapoint whose natural key (``external_id``) is not in that set
+        is removed: an entity that left the source (a movie off the cinema
+        program) is dropped from the collection so a match never fires on a
+        stale item.
+
+        ``only_types`` restricts the purge to the given ``payload_type`` names
+        (e.g. ``{"CinemaMovie"}``): a run that re-scraped only one kind of
+        entity then leaves the other kinds untouched, so a source that failed
+        to scrape this run does not have its datapoints wiped. Datapoints with
+        no ``external_id`` are always kept (there is no identity to compare).
+
+        Guarded: an EMPTY ``keep_ids`` purges NOTHING (a scrape that returned
+        nothing is treated as a failure, never as "everything is gone"), so a
+        transient error can never empty the collection.
+
+        Returns the number of datapoints removed, ``-1`` on failure.
+        """
+        keep = {str(k).strip() for k in (keep_ids or []) if str(k).strip()}
+        if not keep:
+            log.info("DataGrounding - purge_absent on '%s' skipped: empty keep "
+                     "set (treated as a failed scrape).", self.collection_name)
+            return 0
+        if not self.exists():
+            return 0
+        type_filter = set(only_types) if only_types is not None else None
+        try:
+            doomed = []
+            offset = None
+            while True:
+                points, offset = self.client.scroll(
+                    collection_name=self.collection_name, limit=256, offset=offset,
+                    with_payload=[EXTERNAL_ID, PAYLOAD_TYPE], with_vectors=False)
+                for point in points:
+                    payload = point.payload or {}
+                    if (type_filter is not None
+                            and payload.get(PAYLOAD_TYPE) not in type_filter):
+                        continue  # a kind this run did not re-enumerate
+                    external = payload.get(EXTERNAL_ID)
+                    if external and str(external).strip() not in keep:
+                        doomed.append(point.id)
+                if offset is None or not points:
+                    break
+            if doomed:
+                self.client.delete(
+                    collection_name=self.collection_name,
+                    points_selector=PointIdsList(points=doomed))
+            log.info("DataGrounding - purge_absent removed %d stale datapoint(s) "
+                     "from '%s' (%d identities kept%s).",
+                     len(doomed), self.collection_name, len(keep),
+                     f", types={sorted(type_filter)}" if type_filter else "")
+            return len(doomed)
+        except Exception as exc:  # noqa: BLE001
+            log.error("DataGrounding - purge_absent on '%s' failed: %s",
+                      self.collection_name, exc)
+            return -1
+
     # ------------------------------------------------------------------
     # Time-to-live
     # ------------------------------------------------------------------
@@ -562,7 +625,8 @@ class DataGrounding:
     def find_duplicate(self, payload: BaseModel,
                        string_threshold: float = DEFAULT_STRING_THRESHOLD,
                        vector_threshold: float = DEFAULT_VECTOR_THRESHOLD,
-                       scan_limit: int = DEFAULT_FUZZY_SCAN_LIMIT
+                       scan_limit: int = DEFAULT_FUZZY_SCAN_LIMIT,
+                       vector: Optional[Sequence[float]] = None
                        ) -> Optional[Tuple[Union[str, int], float, str]]:
         """The datapoint already representing this entity, if any.
 
@@ -582,9 +646,54 @@ class DataGrounding:
            Catches the same entity described under a different name, which no
            string comparison can see.
 
+        ``vector`` is an optional precomputed embedding of this payload (from
+        :meth:`encode_many`): when given, the vector stage reuses it instead of
+        embedding the payload again — which is what lets the batched grounding
+        path spend a single embedding request on a whole page.
+
         Returns:
             ``(point_id, score, "identity" | "fuzzy" | "vector")`` for the
             first check that fires, or ``None`` when the entity looks new.
+        """
+        if not self.exists() or self.count() == 0:
+            return None
+
+        cheap = self._cheap_duplicate(payload, string_threshold, scan_limit)
+        if cheap is not None:
+            point_id, score, kind = cheap
+            if kind == "identity":
+                log.info("DataGrounding - identity match on %s in '%s'.",
+                         point_id, self.collection_name)
+            else:
+                log.info("DataGrounding - fuzzy match on %s (%.3f) in '%s'.",
+                         point_id, score, self.collection_name)
+            return cheap
+
+        if vector is None:
+            vector = self.encode(payload)
+        if vector is None:
+            return None
+        hits = self.search(vector, top_k=1)
+        if hits and hits[0]["score"] >= vector_threshold:
+            log.info(
+                "DataGrounding - payload matches datapoint %s "
+                "(cosine=%.3f) in '%s'.",
+                hits[0]["id"], hits[0]["score"], self.collection_name,
+            )
+            return hits[0]["id"], hits[0]["score"], "vector"
+        return None
+
+    def _cheap_duplicate(self, payload: BaseModel,
+                         string_threshold: float = DEFAULT_STRING_THRESHOLD,
+                         scan_limit: int = DEFAULT_FUZZY_SCAN_LIMIT
+                         ) -> Optional[Tuple[Union[str, int], float, str]]:
+        """The identity + fuzzy half of :meth:`find_duplicate` — no embedding.
+
+        Split out so both the single and the batched grounding paths share one
+        definition of an identity / fuzzy match, and so the batched path can
+        drop already-known entities *before* embedding (an entity caught here
+        never reaches the embedder). Returns the same ``(point_id, score,
+        kind)`` shape, or ``None`` when only the vector stage could still match.
         """
         if not self.exists() or self.count() == 0:
             return None
@@ -593,8 +702,6 @@ class DataGrounding:
 
         identity = self._find_by_identity(body)
         if identity is not None:
-            log.info("DataGrounding - identity match on %s in '%s'.",
-                     identity, self.collection_name)
             return identity, 1.0, "identity"
 
         title = self._title_of(body)
@@ -606,25 +713,8 @@ class DataGrounding:
                 key=lambda pair: pair[1],
             )
             if match is not None:
-                (point_id, stored_title), score = match
-                log.info(
-                    "DataGrounding - '%s' matches stored '%s' (id=%s, fuzzy=%.3f) "
-                    "in '%s'.", title, stored_title, point_id, score,
-                    self.collection_name,
-                )
+                (point_id, _stored_title), score = match
                 return point_id, score, "fuzzy"
-
-        vector = self.encode(payload)
-        if vector is None:
-            return None
-        hits = self.search(vector, top_k=1)
-        if hits and hits[0]["score"] >= vector_threshold:
-            log.info(
-                "DataGrounding - payload matches datapoint %s "
-                "(cosine=%.3f) in '%s'.",
-                hits[0]["id"], hits[0]["score"], self.collection_name,
-            )
-            return hits[0]["id"], hits[0]["score"], "vector"
         return None
 
     def search(self, vector: Sequence[float], top_k: int = 10) -> List[Dict[str, Any]]:
@@ -882,6 +972,130 @@ class DataGrounding:
         if not text:
             return None
         return self.embed().encode(text)
+
+    def batch_embed(self) -> BatchEmbed:
+        """The lazily built :class:`~vectorize.embeddings.BatchEmbed` for this collection.
+
+        The batch twin of :meth:`embed`: it embeds many texts in one call (the
+        Google backend packs them into a single request, far below the
+        per-minute request quota that one-embed-per-entity bursts trip). Built
+        on first use so a purge or a remove still needs no model / API key.
+        """
+        if self._batch_embed is None:
+            self._batch_embed = BatchEmbed(
+                self.embedding, self.aggregation, self.vector_dimension)
+        return self._batch_embed
+
+    def encode_many(self, payloads: Sequence[BaseModel]
+                    ) -> List[Optional[List[float]]]:
+        """Embed several payloads at once, aligned to the input order.
+
+        Payloads with no embeddable text yield ``None`` (as :meth:`encode`
+        does) and are never sent to the embedder; the rest are embedded in a
+        single :meth:`batch_embed` call. The result has one entry per input,
+        in the same order, so callers can ``zip`` it back onto their payloads.
+        """
+        payloads = list(payloads or [])
+        vectors: List[Optional[List[float]]] = [None] * len(payloads)
+
+        to_embed = [(i, self.embeddable_text(p)) for i, p in enumerate(payloads)]
+        to_embed = [(i, text) for i, text in to_embed if text]
+        if not to_embed:
+            return vectors
+
+        texts = [text for _, text in to_embed]
+        if self._batch_embed is None and self._embed is not None:
+            # A single embedder is already in play (injected in tests, or built
+            # by a prior search): embed text-by-text with it rather than
+            # spinning up a second backend. Production reaches ground_entities
+            # with neither built, so the batched backend is used.
+            encoded = [self._embed.encode(text) for text in texts]
+        else:
+            encoded = self.batch_embed().encode(texts)
+        if len(encoded) != len(texts):
+            raise ValueError(
+                f"BatchEmbed returned {len(encoded)} vectors for {len(texts)} "
+                f"texts embedding collection '{self.collection_name}'."
+            )
+        for (index, _text), vector in zip(to_embed, encoded):
+            vectors[index] = list(vector)
+        return vectors
+
+    def ground_entities(self, entities: Sequence[BaseModel],
+                        point_id_of: Optional[Callable[[BaseModel], Any]] = None,
+                        string_threshold: float = DEFAULT_STRING_THRESHOLD,
+                        vector_threshold: float = DEFAULT_VECTOR_THRESHOLD,
+                        scan_limit: int = DEFAULT_FUZZY_SCAN_LIMIT
+                        ) -> List[BaseModel]:
+        """Ground many entities in as few embedding requests as possible.
+
+        The batched counterpart of a ``find_duplicate`` + ``add`` loop, in two
+        passes so the embedding is both minimal and batched:
+
+        1. **cheap dedup** (:meth:`_cheap_duplicate`) — identity + fuzzy, no
+           embedding: entities already stored (a re-run of the same page) are
+           dropped here, so a steady collection embeds nothing at all.
+        2. **batched embedding** — the survivors are embedded in one
+           :meth:`encode_many` call, then vector-deduped and stored with their
+           precomputed vectors reused (no second embedding). Storing is
+           incremental so an entity duplicating an earlier survivor of the same
+           batch is still caught (identity / fuzzy / vector) before it is added.
+
+        ``point_id_of`` maps an entity to the natural key it is stored under
+        (e.g. its detail URL); ``None`` lets :meth:`add` mint a UUID.
+
+        Returns the entities newly stored — exactly the findings worth acting
+        on. Resilient: a batch-embedding failure falls back to per-entity
+        embedding, and one entity that fails to ground never stops the rest.
+        """
+        entities = list(entities or [])
+        if not entities:
+            return []
+
+        # ── Pass 1: identity + fuzzy dedup, no embedding ──────────────────
+        survivors: List[BaseModel] = []
+        for entity in entities:
+            if self._cheap_duplicate(entity, string_threshold, scan_limit) is not None:
+                continue
+            survivors.append(entity)
+        if not survivors:
+            log.info("DataGrounding - all %d entities already grounded in '%s'.",
+                     len(entities), self.collection_name)
+            return []
+
+        # ── Pass 2: one batched embedding, then vector-dedup + store ──────
+        try:
+            vectors = self.encode_many(survivors)
+        except Exception as exc:  # noqa: BLE001 - degrade to per-entity embedding
+            log.error("DataGrounding - batch embedding failed for '%s': %s; "
+                      "falling back to per-entity embedding.",
+                      self.collection_name, exc)
+            vectors = [None] * len(survivors)
+
+        stored: List[BaseModel] = []
+        for entity, vector in zip(survivors, vectors):
+            identity = point_id_of(entity) if point_id_of else None
+            try:
+                duplicate = self.find_duplicate(
+                    entity, string_threshold=string_threshold,
+                    vector_threshold=vector_threshold, scan_limit=scan_limit,
+                    vector=vector,
+                )
+                if duplicate is not None:
+                    log.info("DataGrounding - '%s' already grounded in '%s' (%s).",
+                             identity if identity is not None else "?",
+                             self.collection_name, duplicate[2])
+                    continue
+                if self.add(entity, point_id=identity, vector=vector) is not None:
+                    stored.append(entity)
+            except Exception as exc:  # noqa: BLE001 - one bad entity must not stop the run
+                log.error("DataGrounding - grounding '%s' failed: %s",
+                          identity if identity is not None else "?", exc)
+
+        log.info("DataGrounding - %d new datapoint(s) grounded in '%s' "
+                 "(%d entities, one batched embedding).",
+                 len(stored), self.collection_name, len(entities))
+        return stored
 
     def embeddable_text(self, payload: BaseModel) -> str:
         """The text embedded for a payload: :attr:`embedded_fields` joined.
