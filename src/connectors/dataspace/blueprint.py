@@ -78,15 +78,17 @@ class DataspaceBlueprint(BaseModel):
 
 
 class CollectionReport(BaseModel):
-    """What :meth:`DataspaceCodeGenerator.collect` did, for the UI and the log.
+    """What :meth:`~connectors.dataspace.collector.DataspaceCollector.collect`
+    did, for the UI and the log.
 
-    A merged collection is several things at once — searched, recalled,
+    A merged collection is several things at once — searched, listed, recalled,
     crawled, verified, repaired — and a bare entity count would hide which of
     them actually carried the list. Knowing that everything came from model
-    knowledge (and nothing from search or the index) is exactly what tells the
-    user how much to trust the file.
+    knowledge (and nothing from a search engine or the index) is exactly what
+    tells the user how much to trust the file.
     """
-    #: Entities each source proposed, keyed ``search`` / ``memory`` / ``crawl``.
+    #: Entities each source proposed, keyed ``search`` (Gemini's web search),
+    #: ``cse`` (Google CSE results), ``memory`` (the host LLM) or ``crawl``.
     proposed: Dict[str, int] = Field(default_factory=dict)
     #: Entities kept after merging the sources.
     merged: int = 0
@@ -106,9 +108,9 @@ class CollectionReport(BaseModel):
 
     def method(self) -> str:
         """The provenance recorded in the saved file: the sources that fired."""
-        names = {"search": "web search", "memory": "model knowledge",
-                 "crawl": "crawled index"}
-        used = [names[key] for key, count in self.proposed.items() if count]
+        names = {"search": "web search", "cse": "search-engine results",
+                 "memory": "model knowledge", "crawl": "crawled index"}
+        used = [names.get(key, key) for key, count in self.proposed.items() if count]
         return " + ".join(used) if used else "no source"
 
     def summary(self) -> str:

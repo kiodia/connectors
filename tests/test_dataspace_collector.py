@@ -39,8 +39,10 @@ def collector(monkeypatch):
     """A collector that never touches the network."""
     made = DataspaceCollector()
     monkeypatch.setattr(type(made), "search_available", staticmethod(lambda: True))
+    monkeypatch.setattr(type(made), "cse_available", staticmethod(lambda: True))
     monkeypatch.setattr(made, "_is_reachable", lambda url: url in ALIVE)
     monkeypatch.setattr(made, "research", lambda spec, limit: None)
+    monkeypatch.setattr(made, "cse", lambda spec, limit: None)
     monkeypatch.setattr(made, "generate", lambda spec, limit: None)
     monkeypatch.setattr(made, "discover", lambda spec, urls, limit: None)
     monkeypatch.setattr(made, "repair", lambda spec, names: [])
@@ -167,12 +169,109 @@ def test_an_echoed_program_url_is_stripped():
     assert "program_url" not in made.entities[0]
 
 
+# ── The search engine's own results ───────────────────────────────────────
+
+def cse_collector(monkeypatch, results, answer):
+    """A collector whose CSE source returns ``results`` and whose LLM answers."""
+    from connectors import googlesearch
+
+    made = DataspaceCollector(llm=lambda prompt: answer)
+    monkeypatch.setattr(googlesearch, "available", lambda: True)
+    monkeypatch.setattr(googlesearch, "get_results", lambda query, pages=1: results)
+    return made
+
+
+def test_the_cse_source_names_entities_among_the_results(monkeypatch):
+    results = [
+        {"title": "Arena Cinemas Fribourg", "url": "https://www.arena.ch/fr/fribourg",
+         "snippet": "10 salles au Fribourg Centre"},
+        {"title": "Cineplus", "url": "https://www.cineplus.ch/", "snippet": "association"},
+    ]
+    answer = """{"name": "fribourg-cinema", "collection_key": "cinemas",
+                 "context": {"city": "Fribourg"}, "entities": [
+                   {"name": "Arena Cinemas Fribourg Centre",
+                    "url": "https://www.arena.ch/fr/fribourg"},
+                   {"name": "Cineplus", "url": "https://www.cineplus.ch/"}]}"""
+    made = cse_collector(monkeypatch, results, answer)
+
+    collected = made.cse("the cinemas of Fribourg")
+
+    assert [e["url"] for e in collected.entities] == [
+        "https://www.arena.ch/fr/fribourg", "https://www.cineplus.ch/"]
+
+
+def test_the_cse_source_cannot_return_a_url_the_engine_did_not(monkeypatch):
+    """The guarantee of a listed source: no address of the model's own making."""
+    results = [{"title": "Arena Cinemas Fribourg",
+                "url": "https://www.arena.ch/fr/fribourg", "snippet": ""}]
+    answer = """{"name": "x", "entities": [
+                   {"name": "Arena", "url": "https://www.arena.ch/fr/fribourg"},
+                   {"name": "Invented", "url": "https://fribourg.arena.ch/"}]}"""
+    made = cse_collector(monkeypatch, results, answer)
+
+    collected = made.cse("the cinemas of Fribourg")
+
+    assert [e["name"] for e in collected.entities] == ["Arena"]
+
+
+def test_the_cse_source_drops_social_and_asset_results(monkeypatch):
+    results = [
+        {"title": "Arena on Facebook", "url": "https://www.facebook.com/arena", "snippet": ""},
+        {"title": "Programme PDF", "url": "https://arena.ch/prog.pdf", "snippet": ""},
+    ]
+    asked = []
+    made = cse_collector(monkeypatch, results, "{}")
+    made.llm = lambda prompt: asked.append(prompt) or "{}"
+
+    assert made.cse("the cinemas of Fribourg") is None
+    assert asked == []          # nothing usable: the LLM is never even called
+
+
+def test_the_cse_source_is_skipped_without_an_llm(monkeypatch):
+    from connectors import googlesearch
+    monkeypatch.setattr(googlesearch, "available", lambda: True)
+    monkeypatch.setattr(googlesearch, "get_results",
+                        lambda query, pages=1: [{"title": "x", "url": "https://a.ch/",
+                                                 "snippet": ""}])
+    assert DataspaceCollector().cse("anything") is None
+
+
+def test_a_source_without_credentials_is_reported_not_run(monkeypatch):
+    made = DataspaceCollector()
+    monkeypatch.setattr(type(made), "search_available", staticmethod(lambda: False))
+    monkeypatch.setattr(type(made), "cse_available", staticmethod(lambda: False))
+    monkeypatch.setattr(made, "generate", lambda spec, limit: None)
+    monkeypatch.setattr(made, "discover", lambda spec, urls, limit: None)
+
+    _, report = made.collect("the cinemas of Fribourg")
+
+    assert "GEMINI_API_KEY" in report.failures["search"]
+    assert "GOOGLE_CSE_KEY" in report.failures["cse"]
+
+
+def test_the_cse_source_merges_with_the_others(collector, monkeypatch):
+    monkeypatch.setattr(collector, "cse", lambda spec, limit: blueprint([
+        {"name": "Arena Cinemas Fribourg", "url": "https://www.arena.ch/fr/fribourg"},
+    ]))
+    monkeypatch.setattr(collector, "generate", lambda spec, limit: blueprint([
+        {"name": "Arena Cinemas Fribourg Centre", "url": "https://fribourg.arena.ch/",
+         "program_url": "https://www.arena.ch/fr/fribourg/programme"},
+    ]))
+    collected, report = collector.collect("the cinemas of Fribourg")
+
+    assert len(collected.entities) == 1
+    assert collected.entities[0]["url"] == "https://www.arena.ch/fr/fribourg"
+    assert report.corroborated == 1
+    assert report.proposed["cse"] == 1
+
+
 # ── The report ────────────────────────────────────────────────────────────
 
 def test_the_report_names_the_sources_that_fired():
-    report = CollectionReport(proposed={"search": 3, "memory": 0, "crawl": 2}, merged=4)
-    assert report.method() == "web search + crawled index"
-    assert report.summary().startswith("4 source(s) collected (3 search, 2 crawl)")
+    report = CollectionReport(
+        proposed={"search": 3, "cse": 2, "memory": 0, "crawl": 2}, merged=5)
+    assert report.method() == "web search + search-engine results + crawled index"
+    assert report.summary().startswith("5 source(s) collected (3 search, 2 cse, 2 crawl)")
 
 
 def test_nothing_collected_is_reported_not_raised(collector):

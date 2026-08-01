@@ -13,13 +13,19 @@ of the scraping both MatchMake and keopy run. That is also why the checks here
 are what they are — a dead URL grounds nothing, and two entities sharing a URL
 ground as one.
 
-**Three sources, merged** — :meth:`DataspaceCollector.collect` is the entry
+**Four sources, merged** — :meth:`DataspaceCollector.collect` is the entry
 point and runs them together, because each is strong where the others are weak:
 
 * :meth:`~DataspaceCollector.research` — **live web search** (Gemini's
   ``google_search`` tool, ``GEMINI_API_KEY``). The model quotes URLs out of real
   results instead of reconstructing them, which is what stops the
   invented-address failure below. Best precision.
+* :meth:`~DataspaceCollector.cse` — **the search engine's own results** (Google
+  Programmable Search through :mod:`connectors.googlesearch`,
+  ``GOOGLE_CSE_KEY`` + ``GOOGLE_CSE_CX``). No model stands between the index and
+  the list: the LLM only picks and names among the addresses the API returned,
+  so an address it did not return cannot appear. Sees the thirty pages an
+  engine ranked where the searched source summarizes the few it read.
 * :meth:`~DataspaceCollector.generate` — **from model knowledge**, through the
   host's own LLM. Instant, free, and it proposes entities a search page ranks
   too low to show. Best coverage of the well-known, worst precision.
@@ -28,7 +34,10 @@ point and runs them together, because each is strong where the others are weak:
   the links the page really contains, so a URL can only be one it published.
   Slower, and the only way to be exhaustive about a set nobody summarizes.
 
-Recall is the union of the three (:meth:`~DataspaceCollector.collect` merges
+A source whose credentials are missing is skipped with its reason in the
+report, so a deployment configures what it has and still collects.
+
+Recall is the union of them (:meth:`~DataspaceCollector.collect` merges
 entities across sources on name or shared URL, so an entity found twice keeps
 the best URLs of both). Precision is what happens next: every URL is fetched,
 and an entity that loses its URLs is **repaired** — searched for by name —
@@ -84,17 +93,18 @@ _VERIFY_HEADERS = {
 
 
 class DataspaceCollector:
-    """Generates a Dataspace URL list on-the-fly, from three merged sources.
+    """Generates a Dataspace URL list on-the-fly, from four merged sources.
 
-    The text LLM of the recalled and crawled sources comes from the host (see
-    :meth:`_llm`); the searched source brings its own model, Gemini with the
-    ``google_search`` tool, so a caller with no LLM at all still collects.
+    The host's LLM (see :meth:`_llm`) is what the recalled and crawled sources
+    talk to, and what picks among the CSE results; the searched source brings
+    its own model, Gemini with the ``google_search`` tool, so a caller with no
+    LLM at all still collects.
 
     :meth:`collect` is what callers use; it runs the sources in parallel and
     then does the work that turns candidates into a Dataspace:
 
-    1. :meth:`research` / :meth:`generate` / :meth:`discover` — the three
-       sources, each returning its own blueprint (recall).
+    1. :meth:`research` / :meth:`cse` / :meth:`generate` / :meth:`discover` —
+       the four sources, each returning its own blueprint (recall).
     2. merge — entities are matched across sources on their name or on a shared
        URL, and an entity found twice keeps the union of its URLs.
     3. :meth:`verify` — every URL is fetched; the dead ones are dropped
@@ -142,6 +152,11 @@ class DataspaceCollector:
     #: stay on one model.
     SEARCH_MODEL_ENV = ("GEMINI_DATASPACE_MODEL", "GEMINI_RESEARCH_MODEL")
     DEFAULT_SEARCH_MODEL = "gemini-3.5-flash"
+
+    #: Pages of Google CSE results the :meth:`cse` source reads, ten each. Three
+    #: is what covers a city's worth of venues while staying well inside the
+    #: 100 free queries a day: one collection spends three of them.
+    CSE_PAGES = 3
 
     #: Host of Gemini's grounding redirects. The model sometimes quotes those
     #: instead of the page's own address; they answer (so verification keeps
@@ -220,15 +235,21 @@ class DataspaceCollector:
         say("Searching, recalling and crawling...")
         runners = {
             "search": lambda: self.research(specification, limit),
+            "cse": lambda: self.cse(specification, limit),
             "memory": lambda: self.generate(specification, limit),
             "crawl": lambda: self.discover(specification, index_urls, limit),
         }
+        # A source that cannot run at all is dropped with its reason rather than
+        # started and failed: "no key" explains a thinner list than usual, and
+        # it is the kind of thing a user can fix.
         if not self.search_available():
-            # Without the key the searched source cannot run at all; saying so
-            # in the report is what explains a thinner list than usual.
             del runners["search"]
             report.failures["search"] = ("GEMINI_API_KEY is not set — the web "
                                          "search source did not run.")
+        if not self.cse_available():
+            del runners["cse"]
+            report.failures["cse"] = ("GOOGLE_CSE_KEY / GOOGLE_CSE_CX are not "
+                                      "set — the search-engine source did not run.")
         blueprints: Dict[str, DataspaceBlueprint] = {}
         with ThreadPoolExecutor(max_workers=len(runners)) as pool:
             futures = {pool.submit(runner): key for key, runner in runners.items()}
@@ -273,6 +294,13 @@ class DataspaceCollector:
         say(f"Verifying {len(merged.urls)} URL(s)...")
         before = {self._entity_name(entity): entity for entity in merged.entities}
         merged, report.dropped, _ = self.verify(merged)
+        # What counts as surviving is carrying a URL, not surviving the fetch:
+        # a lead named without one was never fetched at all (with nothing but
+        # leads, there is no URL to fetch and the verification is a no-op), and
+        # it is exactly as unaddressed as an entity whose URL just 404ed. Both
+        # go to the repair below, and neither reaches the file unaddressed.
+        merged.entities = [entity for entity in merged.entities
+                           if any(entity.get(key) for key in URL_KEYS)]
         survivors = {self._entity_name(entity) for entity in merged.entities}
         lost = [name for name in before if name not in survivors]
 
@@ -328,7 +356,12 @@ class DataspaceCollector:
         ``context``) are taken from the most grounded source that produced
         them, in the order search → crawl → memory.
         """
-        order = [key for key in ("search", "crawl", "memory") if key in blueprints]
+        # Most grounded first: whoever gets here first keeps the field, and the
+        # later sources only fill what is still empty. The searched source
+        # leads because it writes the cleanest names and context; recall from
+        # memory comes last, being the one that invents addresses.
+        order = [key for key in ("search", "cse", "crawl", "memory")
+                 if key in blueprints]
         head = blueprints[order[0]]
         merged = DataspaceBlueprint(
             name=head.name, description=head.description,
@@ -802,6 +835,64 @@ class DataspaceCollector:
         return not self._SKIP_PATTERN.search(url)
 
     # ─────────────────────────────────────────────────────────────────────
+    #  1b'. The search engine's own results (Google CSE)
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def cse_available() -> bool:
+        """Whether Google CSE can run — it needs its key and its engine id."""
+        from connectors import googlesearch
+        return googlesearch.available()
+
+    def cse(self, specification: str, limit: int = 25) -> Optional[DataspaceBlueprint]:
+        """Enumerate the entities among **the search engine's result pages**.
+
+        The other grounded source, and the one no model stands between: Google
+        CSE returns the addresses it indexed, and the LLM only picks and names
+        among them (:meth:`_select_entities` drops anything that was not in the
+        results). Where :meth:`research` can still paraphrase an address it
+        read, this one physically cannot — the URL is copied from the API
+        answer or it does not exist.
+
+        It is worth having next to the searched source because the two see
+        different webs: a model summarizes the few pages it read, an engine
+        lists the thirty it ranked. Needs the host LLM for the selection, like
+        the crawled source; without one the searched source still runs.
+
+        Returns None when the credentials, the LLM or the results are missing.
+        """
+        from connectors import googlesearch
+
+        if not googlesearch.available():
+            log.info("DataspaceCollector - no GOOGLE_CSE_KEY/GOOGLE_CSE_CX, "
+                     "skipping the CSE source")
+            return None
+        if self._llm() is None:
+            log.info("DataspaceCollector - no LLM to select among the CSE "
+                     "results, skipping the CSE source")
+            return None
+
+        try:
+            results = googlesearch.get_results(specification.strip(),
+                                               pages=self.CSE_PAGES)
+        except Exception as exc:  # noqa: BLE001 - the other sources still run
+            log.error("DataspaceCollector - the CSE search failed: %s", exc)
+            return None
+
+        candidates = [{"text": f"{result['title']} — {result['snippet']}".strip(" —"),
+                       "url": result["url"]}
+                      for result in results if self._usable_url(result["url"])]
+        if not candidates:
+            log.info("DataspaceCollector - Google CSE returned no usable result")
+            return None
+        log.info("DataspaceCollector - selecting among %d CSE result(s)",
+                 len(candidates))
+        return self._select_entities(
+            specification, candidates, limit,
+            origin="the Google search results",
+            found_on="the result pages of a web search")
+
+    # ─────────────────────────────────────────────────────────────────────
     #  1c. Discovery by crawling an index page
     # ─────────────────────────────────────────────────────────────────────
 
@@ -854,7 +945,8 @@ class DataspaceCollector:
             log.warning("DataspaceCollector - %s", self.last_failure)
             return None
 
-        blueprint = self._select_entities(specification, candidates, limit, reachable)
+        blueprint = self._select_entities(specification, candidates, limit,
+                                          origin=", ".join(reachable))
         if blueprint is None:
             self.last_failure = (f"None of the {len(candidates)} link(s) on "
                                  f"{', '.join(reachable)} matches the request.")
@@ -982,27 +1074,33 @@ class DataspaceCollector:
         return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
     def _select_entities(self, specification: str, candidates: List[dict],
-                         limit: int, index_urls: List[str]) -> Optional[DataspaceBlueprint]:
-        """Let the LLM pick the requested entities among the crawled links.
+                         limit: int, origin: str,
+                         found_on: str = "an index page") -> Optional[DataspaceBlueprint]:
+        """Let the LLM pick the requested entities among real, listed links.
 
-        The model's job here is selection and naming, not recall: every URL it
-        may use is in front of it. Anything it returns that is not one of the
-        crawled links is dropped — that is the whole guarantee of this mode.
+        Shared by the two sources that bring back links rather than entities —
+        the crawled index and the Google CSE results. The model's job here is
+        selection and naming, not recall: every URL it may use is in front of
+        it, and anything it returns that is not one of those links is dropped.
+        That is the whole guarantee of both sources.
+
+        ``origin`` names where the links come from, for the prompt heading;
+        ``found_on`` describes the kind of place, for the sentence above it.
         """
         llm = self._llm()
         if llm is None:
             return None
         lines = [
-            "You are the Dataspace generator of MatchMake. Below are the links",
-            "found on an index page. Select the ones that ARE the items the",
-            "request asks for — not the navigation, not the news, not the",
-            "contact or login pages.",
+            "You are the Dataspace generator. Below are the links found on",
+            f"{found_on}. Select the ones that ARE the items the request asks",
+            "for — not the navigation, not the news, not the contact or login",
+            "pages, not an article about them.",
             "",
             "# Request",
             "",
             specification.strip(),
             "",
-            "# Links found on " + ", ".join(index_urls),
+            "# Links found on " + origin,
             "",
         ]
         for n, candidate in enumerate(candidates, start=1):
