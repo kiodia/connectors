@@ -21,12 +21,13 @@ from connectors.grounding.data_grounding import (
     UPDATED_TS, DataGrounding,
 )
 from connectors.grounding.entities import (
-    EXTRACTORS, WebDocument, entity_id, extract_entities, page_document,
+    EXTRACTORS, WebDocument, entity_id, extract_entities, merge_duplicates, page_document,
 )
 
 __all__ = [
     "DataGrounding",
     "extract_entities",
+    "merge_duplicates",
     "entity_id",
     "page_document",
     "WebDocument",

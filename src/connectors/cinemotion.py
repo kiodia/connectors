@@ -59,6 +59,11 @@ class CinemaMovie(BaseModel):
         description="Synopsis (director, cast, plot) as markdown, from the "
                     "movie's detail page; \"\" until filled in"
     )
+    cinema: str = Field(default="", description="The cinema (or program) it was "
+                                                "listed by, \"\" for cinemotion.ch")
+    genres: List[str] = Field(default_factory=list,
+                              description="Genres in English (Action, Comedy, ...), "
+                                          "[] when the listing names none")
 
     def to_markdown(self) -> str:
         """The movie as a self-contained markdown card: title heading,
@@ -76,6 +81,10 @@ class CinemaMovie(BaseModel):
           freshly scraped one.
         """
         lines = [f"# {self.title}", ""]
+        meta = " · ".join(part for part in (self.cinema, ", ".join(self.genres)) if part)
+        if meta:
+            lines.append(f"*{meta}*")
+            lines.append("")
         if self.poster_url:
             lines.append(f"![{self.title}]({self.poster_url})")
             lines.append("")
