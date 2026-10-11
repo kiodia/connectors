@@ -125,11 +125,121 @@ def _cinemotion_movies(page, fetch: Optional[Callable] = None) -> List[BaseModel
     return movies
 
 
+def _host_is(*hosts: str) -> Callable:
+    def matches(page) -> bool:
+        url = (getattr(page, "url", "") or "").lower()
+        return any(host in url for host in hosts)
+    return matches
+
+
+def _fill_details(movies: List[BaseModel], fetch: Optional[Callable], fill: Callable) -> None:
+    """Open each movie's own page with ``fetch`` and let ``fill(movie,
+    markdown)`` complete it; a page that cannot be fetched leaves the movie
+    as the listing described it."""
+    if fetch is None:
+        return
+    for movie in movies:
+        if not movie.detail_url:
+            continue
+        try:
+            detail = fetch(movie.detail_url)
+        except Exception as exc:  # noqa: BLE001 - the listing's movie still grounds
+            log.warning("entities - could not fetch %s: %s", movie.detail_url, exc)
+            continue
+        if detail is not None and getattr(detail, "success", False):
+            fill(movie, getattr(detail, "markdown", "") or "")
+
+
+def _arena_movies(page, fetch: Optional[Callable] = None) -> List[BaseModel]:
+    """The movies of an Arena Cinemas program page; the listing carries the
+    synopses, so nothing is fetched."""
+    from connectors.cinema_programs import parse_arena
+    movies = parse_arena(getattr(page, "markdown", "") or "")
+    log.info("entities - %d movie(s) extracted from %s", len(movies), getattr(page, "url", "?"))
+    return movies
+
+
+def _korso_movies(page, fetch: Optional[Callable] = None) -> List[BaseModel]:
+    """The movies of Kino Korso's program, credits and synopsis from each
+    movie's own page."""
+    from connectors.cinema_programs import korso_description, korso_poster, parse_korso
+    movies = parse_korso(getattr(page, "markdown", "") or "")
+
+    def fill(movie, markdown):
+        movie.description = korso_description(markdown, movie.title) or movie.description
+        movie.poster_url = movie.poster_url or korso_poster(markdown, movie.title)
+    _fill_details(movies, fetch, fill)
+    log.info("entities - %d movie(s) extracted from %s", len(movies), getattr(page, "url", "?"))
+    return movies
+
+
+def _outnow_movies(page, fetch: Optional[Callable] = None) -> List[BaseModel]:
+    """The movies of an OutNow city program, synopsis, direction and cast
+    from each movie's own page."""
+    from connectors.cinema_programs import outnow_description, parse_outnow
+    movies = parse_outnow(getattr(page, "markdown", "") or "")
+
+    def fill(movie, markdown):
+        movie.description = outnow_description(markdown) or movie.description
+    _fill_details(movies, fetch, fill)
+    log.info("entities - %d movie(s) extracted from %s", len(movies), getattr(page, "url", "?"))
+    return movies
+
+
 #: ``(matches, extract)`` pairs, consulted in order; the first that returns
 #: entities wins. Append a pair to ground a new source as its own entities.
 EXTRACTORS = [
     (_is_cinemotion, _cinemotion_movies),
+    (_host_is("arena.ch"), _arena_movies),
+    (_host_is("korso.ch"), _korso_movies),
+    (_host_is("outnow.ch"), _outnow_movies),
 ]
+
+
+def _title_key(entity: BaseModel) -> str:
+    """A title as a merge key: unaccented, lower-case, letters and digits only."""
+    import unicodedata
+    title = str(getattr(entity, "title", "") or "")
+    plain = "".join(c for c in unicodedata.normalize("NFKD", title)
+                    if not unicodedata.combining(c))
+    return "".join(c for c in plain.lower() if c.isalnum())
+
+
+def merge_duplicates(entities: List[BaseModel]) -> List[BaseModel]:
+    """One entity per title and kind, across every page of a grounding run.
+
+    The same movie is listed by several programs (Cinemotion's Rex, Arena,
+    OutNow's city listing), each knowing part of it: one has the genres, one
+    the synopsis. Grounding them apart would keep whichever came first and
+    drop the rest as a duplicate, so they are merged before: the first
+    entity stays (its URL is the identity), list fields gain the others'
+    values, and an empty or shorter text field takes the longest one found.
+    Entities without a title are left as they are."""
+    merged: List[BaseModel] = []
+    first: dict = {}
+    for entity in entities:
+        key = (type(entity).__name__, _title_key(entity))
+        if not key[1]:
+            merged.append(entity)
+            continue
+        kept = first.get(key)
+        if kept is None:
+            first[key] = entity
+            merged.append(entity)
+            continue
+        for name in type(kept).model_fields:
+            mine, theirs = getattr(kept, name), getattr(entity, name)
+            if isinstance(mine, list) and isinstance(theirs, list):
+                setattr(kept, name, mine + [v for v in theirs if v not in mine])
+            elif isinstance(mine, str) and isinstance(theirs, str):
+                if name == "description" and len(theirs) > len(mine):
+                    setattr(kept, name, theirs)
+                elif not mine and theirs:
+                    setattr(kept, name, theirs)
+    if len(merged) < len(entities):
+        log.info("entities - %d listing(s) merged into %d entit(ies)",
+                 len(entities), len(merged))
+    return merged
 
 
 def extract_entities(page, fetch: Optional[Callable] = None) -> List[BaseModel]:
