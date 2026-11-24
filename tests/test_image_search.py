@@ -175,7 +175,7 @@ def test_queries_put_the_prompt_first_then_the_liked_then_the_persona():
                              "likes": ["The paintings of Van Gogh"],
                              "intention": "I want calm art for my living room"},
                             prompt="sunflowers in a vase", liked=["Still Life", "Paintings"], n=4)
-    assert queries == ["sunflowers vase", "Still Life Paintings", "impressionism still life",
+    assert queries == ["sunflowers in a vase", "Still Life Paintings", "impressionism still life",
                        "paintings Van Gogh"]
     assert s.queries_for({}, prompt="") == []
 
@@ -252,3 +252,228 @@ def test_two_images_with_the_same_title_are_two_images(grounding):
                                               "https://open.test/a")])
     assert len(first) == 1 and len(second) == 1
     assert grounding.count() == 2
+
+
+def test_the_typed_query_is_searched_as_it_was_typed():
+    from connectors import image_search as s
+    queries = s.queries_for({"keywords": ["impressionism"]},
+                            prompt="  Mona Lisa as   modern art of the 20th century and beyond ")
+    assert queries[0] == "Mona Lisa as modern art of the 20th century and beyond"
+
+
+# ── Reverse image search ───────────────────────────────────────────────────
+
+LENS = {"name": "Lens", "enabled": True, "input": "url", "auth": {"type": "query_param", "env": "LENS_KEY"},
+        "endpoint": "https://lens.test/?url={image_url}&key=${LENS_KEY}",
+        "result_sets": [
+            {"results": "visual_matches",
+             "fields": {"image_url": ["image.link", "thumbnail"], "thumbnail_url": "thumbnail",
+                        "page_url": "link", "title": "title"}},
+            {"results": "exact_matches",
+             "fields": {"image_url": ["image.link", "thumbnail"], "page_url": "link", "title": "title"}}]}
+VISION = {"name": "Vision", "enabled": True, "input": "bytes",
+          "auth": {"type": "query_param", "env": "VISION_KEY"},
+          "endpoint": "https://vision.test/annotate?key=${VISION_KEY}",
+          "body": {"requests": [{"image": {"content": "{image_base64}"},
+                                 "features": [{"type": "WEB_DETECTION", "maxResults": "{limit}"}]}]},
+          "result_sets": [
+              {"results": "responses.0.webDetection.pagesWithMatchingImages",
+               "fields": {"image_url": ["fullMatchingImages.0.url", "partialMatchingImages.0.url"],
+                          "page_url": "url",
+                          "title": ["pageTitle", "root:responses.0.webDetection.bestGuessLabels.0.label"]}},
+              {"results": "responses.0.webDetection.visuallySimilarImages",
+               "fields": {"image_url": "url",
+                          "title": "root:responses.0.webDetection.bestGuessLabels.0.label"}}]}
+DESCRIBE = {"name": "Describe", "kind": "describe_then_search", "enabled": True, "input": "bytes",
+            "auth": {"type": "sdk", "env": "ANTHROPIC_API_KEY"}}
+LENS_ANSWER = {"visual_matches": [{"title": "Mona Lisa", "link": "https://l.test/page",
+                                   "image": {"link": "https://l.test/m.jpg"}, "thumbnail": "https://t.test/m"}],
+               "exact_matches": [{"title": "Louvre", "link": "https://louvre.test/",
+                                  "thumbnail": "https://t.test/l"}]}
+VISION_ANSWER = {"responses": [{"webDetection": {
+    "bestGuessLabels": [{"label": "mona lisa"}],
+    "pagesWithMatchingImages": [{"url": "https://w.test/page", "pageTitle": "<b>Mona</b> Lisa",
+                                 "partialMatchingImages": [{"url": "https://w.test/m.jpg"}]}],
+    "visuallySimilarImages": [{"url": "https://s.test/s.jpg"}]}}]}
+EVERY_KEY = {"LENS_KEY": "k1", "VISION_KEY": "k2", "ANTHROPIC_API_KEY": "k3"}
+
+
+def reverse_spec(*reverse, apis=()):
+    return {"kind": "image_search", "apis": list(apis), "reverse_apis": list(reverse)}
+
+
+def test_the_reverse_engines_follow_their_keys_and_what_they_take():
+    both = reverse_spec(LENS, VISION, DESCRIBE)
+    names = lambda apis: [a["name"] for a in apis]
+    assert names(s.available_reverse_apis(both, "https://w.test/a.jpg", False, EVERY_KEY)) == ["Lens", "Vision"]
+    assert names(s.available_reverse_apis(both, "", True, EVERY_KEY)) == ["Vision"]   # Lens needs a URL
+    assert names(s.available_reverse_apis(both, "https://w.test/a.jpg", False, {"LENS_KEY": "k"})) == ["Lens"]
+    assert s.describe_entry(both, EVERY_KEY)["name"] == "Describe"
+    assert s.describe_entry(both, {}) is None
+
+
+def test_a_text_search_never_asks_a_reverse_engine():
+    calls = []
+    s.search(reverse_spec(LENS, apis=[OPEN]), ["fox"], env=EVERY_KEY,
+             fetch_json=lambda url, headers, timeout: calls.append(url) or {"results": []})
+    assert calls == ["https://open.test/?q=fox&n=8"]
+
+
+def test_a_url_engine_gets_the_image_url_and_reads_every_result_set():
+    calls = []
+    hits = s.reverse_search_api(LENS, image_url="https://w.test/a b.jpg", env=EVERY_KEY,
+                                fetch_json=lambda url, headers, timeout: calls.append(url) or LENS_ANSWER)
+    assert calls == ["https://lens.test/?url=https%3A%2F%2Fw.test%2Fa%20b.jpg&key=k1"]
+    assert [(h.title, h.image_url, h.page_url, h.provider) for h in hits] == [
+        ("Mona Lisa", "https://l.test/m.jpg", "https://l.test/page", "Lens"),
+        ("Louvre", "https://t.test/l", "https://louvre.test/", "Lens")]   # no image: the thumbnail
+
+
+def test_a_bytes_engine_posts_the_file_and_reads_the_root_label():
+    import base64
+    posted = []
+
+    def post(url, headers, body, timeout):
+        posted.append((url, body))
+        return VISION_ANSWER
+    hits = s.reverse_search_api(VISION, image_bytes=b"\xff\xd8pixels", limit=3, env=EVERY_KEY,
+                                post_json=post)
+    url, body = posted[0]
+    request = body["requests"][0]
+    assert url == "https://vision.test/annotate?key=k2"
+    assert base64.b64decode(request["image"]["content"]) == b"\xff\xd8pixels"
+    assert request["features"] == [{"type": "WEB_DETECTION", "maxResults": 3}]   # a number, not "3"
+    assert [(h.title, h.image_url, h.page_url) for h in hits] == [
+        ("Mona Lisa", "https://w.test/m.jpg", "https://w.test/page"),
+        ("mona lisa", "https://s.test/s.jpg", "")]
+
+
+LENS_UPLOAD = dict(LENS, upload={
+    "url": "https://lens.test/image", "file_field": "image", "fields": {"api_key": "${LENS_KEY}"},
+    "id": "image_id", "search": "https://lens.test/?image_id={image_id}&key=${LENS_KEY}"})
+
+
+def test_a_url_engine_with_an_upload_takes_a_local_file():
+    names = lambda apis: [a["name"] for a in apis]
+    spec = reverse_spec(LENS_UPLOAD, VISION)
+    assert names(s.available_reverse_apis(spec, "", True, EVERY_KEY)) == ["Lens", "Vision"]
+    assert names(s.available_reverse_apis(reverse_spec(LENS), "", True, EVERY_KEY)) == []
+    assert names(s.available_reverse_apis(spec, "", False, EVERY_KEY)) == []
+
+
+def test_a_local_file_is_uploaded_then_searched_by_its_id():
+    posted, calls = [], []
+
+    def post_form(url, headers, fields, file_field, filename, data, mime, timeout):
+        posted.append((url, fields, file_field, filename, data, mime))
+        return {"message": "Image uploaded successfully.", "image_id": "abc/1"}
+    hits = s.reverse_search_api(LENS_UPLOAD, image_bytes=b"\xff\xd8\xffpixels", env=EVERY_KEY,
+                                fetch_json=lambda url, headers, timeout: calls.append(url) or LENS_ANSWER,
+                                post_form=post_form)
+    assert posted == [("https://lens.test/image", {"api_key": "k1"}, "image", "image.jpg",
+                       b"\xff\xd8\xffpixels", "image/jpeg")]
+    assert calls == ["https://lens.test/?image_id=abc%2F1&key=k1"]
+    assert [h.title for h in hits] == ["Mona Lisa", "Louvre"]
+
+
+def test_a_public_url_is_used_before_an_upload():
+    calls = []
+    s.reverse_search_api(LENS_UPLOAD, image_url="https://w.test/a.jpg", image_bytes=b"\xff\xd8\xffx",
+                         env=EVERY_KEY, fetch_json=lambda url, h, t: calls.append(url) or LENS_ANSWER,
+                         post_form=lambda *a: pytest.fail("uploaded although there is a URL"))
+    assert calls[0].startswith("https://lens.test/?url=")
+
+
+def test_a_refused_upload_leaves_the_engine_empty():
+    hits = s.reverse_search_api(LENS_UPLOAD, image_bytes=b"\xff\xd8\xffx", env=EVERY_KEY,
+                                fetch_json=lambda *a: pytest.fail("searched without an id"),
+                                post_form=lambda *a: {"error": "Invalid image format."})
+    assert hits == []
+
+
+def _counting_form(uploads):
+    def post_form(*args):
+        uploads.append(args[0])
+        return {"image_id": "id-1"}
+    return post_form
+
+
+def test_the_upload_waits_while_vision_finds_the_file():
+    uploads = []
+    hits = s.reverse_search(reverse_spec(LENS_UPLOAD, VISION), image_bytes=b"\xff\xd8\xffx",
+                            env=EVERY_KEY, fetch_json=lambda *a: LENS_ANSWER,
+                            post_json=lambda *a: VISION_ANSWER, post_form=_counting_form(uploads))
+    assert uploads == [] and {h.provider for h in hits} == {"Vision"}
+
+
+def test_the_file_is_uploaded_when_vision_finds_nothing():
+    uploads = []
+    hits = s.reverse_search(reverse_spec(LENS_UPLOAD, VISION), image_bytes=b"\xff\xd8\xffx",
+                            env=EVERY_KEY, fetch_json=lambda *a: LENS_ANSWER,
+                            post_json=lambda *a: {"responses": [{}]}, post_form=_counting_form(uploads))
+    assert uploads == ["https://lens.test/image"] and {h.provider for h in hits} == {"Lens"}
+
+
+def test_the_file_is_uploaded_when_vision_has_no_key():
+    uploads = []
+    hits = s.reverse_search(reverse_spec(LENS_UPLOAD, VISION), image_bytes=b"\xff\xd8\xffx",
+                            env={"LENS_KEY": "k1"}, fetch_json=lambda *a: LENS_ANSWER,
+                            post_json=lambda *a: pytest.fail("Vision has no key"),
+                            post_form=_counting_form(uploads))
+    assert uploads == ["https://lens.test/image"] and {h.provider for h in hits} == {"Lens"}
+
+
+def test_a_public_url_keeps_lens_beside_vision_without_an_upload():
+    uploads = []
+    hits = s.reverse_search(reverse_spec(LENS_UPLOAD, VISION), image_url="https://w.test/a.jpg",
+                            image_bytes=b"\xff\xd8\xffx", env=EVERY_KEY,
+                            fetch_json=lambda *a: LENS_ANSWER, post_json=lambda *a: VISION_ANSWER,
+                            post_form=_counting_form(uploads))
+    assert uploads == [] and {h.provider for h in hits} == {"Lens", "Vision"}
+
+
+def test_a_picture_too_big_for_the_upload_is_made_smaller():
+    import io
+    Image = pytest.importorskip("PIL.Image")
+    import random
+    rng = random.Random(1)
+    image = Image.new("RGB", (1600, 1200))
+    image.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256))
+                   for _ in range(1600 * 1200)])
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    assert len(out.getvalue()) > s.UPLOAD_MAX_BYTES
+    data, mime = s.fit_upload(out.getvalue())
+    assert mime == "image/jpeg" and len(data) <= s.UPLOAD_MAX_BYTES
+    small = b"\x89PNG\r\n\x1a\n" + b"x" * 100
+    assert s.fit_upload(small) == (small, "image/png")          # fits: sent as it is
+    assert s.fit_upload(b"not a picture" * 50000) is None
+
+
+def test_reverse_search_merges_the_engines():
+    hits = s.reverse_search(reverse_spec(LENS, VISION), image_url="https://w.test/a.jpg",
+                            image_bytes=b"\xff\xd8pixels", env=EVERY_KEY,
+                            fetch_json=lambda *a: LENS_ANSWER, post_json=lambda *a: VISION_ANSWER)
+    assert [h.provider for h in hits] == ["Lens", "Vision", "Lens", "Vision"]
+
+
+def test_describe_then_search_is_the_fallback_for_a_local_file():
+    described = []
+
+    def describe(data, mime):
+        described.append((data, mime))
+        return "Mona Lisa Leonardo"
+    calls = []
+    hits = s.reverse_search(reverse_spec(LENS, DESCRIBE, apis=[OPEN]), image_bytes=b"\xff\xd8pixels",
+                            env=EVERY_KEY, describe=describe,
+                            fetch_json=lambda url, headers, timeout: calls.append(url) or
+                            {"results": [{"url": "https://o.test/m.jpg", "title": "Mona"}]})
+    assert described == [(b"\xff\xd8pixels", "image/jpeg")]
+    assert calls == ["https://open.test/?q=Mona%20Lisa%20Leonardo&n=8"]
+    assert [(h.title, h.query) for h in hits] == [("Mona", "Mona Lisa Leonardo")]
+
+
+def test_no_engine_and_no_describer_finds_nothing():
+    assert s.reverse_search(reverse_spec(LENS), image_bytes=b"\xff\xd8x", env=EVERY_KEY) == []
+    off = dict(DESCRIBE, enabled=False)
+    assert s.reverse_search(reverse_spec(off), image_bytes=b"\xff\xd8x", env=EVERY_KEY) == []
