@@ -27,6 +27,20 @@ Dataspace in its Canvas AX, keopy (``angel_grounding.py``) grounds them for
 the image Angel that notifies the Newsroom — so an image grounded on either
 side is the same datapoint.
 
+**Reverse image search** (:func:`reverse_search`) reads the spec's separate
+``reverse_apis`` list: an image in - its public URL (``"input": "url"``, the
+endpoint's ``{image_url}``) or the file itself (``"input": "bytes"``, a POST
+``body`` with ``{image_base64}``) - and the pages it appears on and the images
+like it out, as :class:`ImageHit`. A ``url`` engine with an ``upload`` block
+takes a local file too: the file is uploaded first (SerpApi's
+``https://serpapi.com/image``) and the engine searched with the id it gives
+(``{image_id}`` in the block's ``search`` endpoint); a public URL is still
+used when there is one. An entry may read several lists of an
+answer (``result_sets``), a field rule may be a list (the first that gives a
+value) or ``root:<path>`` (off the answer's root). The ``describe_then_search``
+entry is the fallback: Claude writes the query the picture would be found by
+and the text APIs search it.
+
 **What a datapoint's vector is.** :class:`ImageGrounding` embeds the picture
 itself with its caption — ``models/gemini-embedding-2`` maps text and images
 into one space — so the persona's words, its likes and the session query are
@@ -189,8 +203,12 @@ def is_image_search(source: Any) -> bool:
 
 def missing_keys(api: Mapping[str, Any], env: Mapping[str, str]) -> List[str]:
     """The environment variables an API entry needs and ``env`` lacks."""
-    text = json.dumps({k: api.get(k) for k in ("endpoint", "auth", "headers", "detail")})
-    return sorted({name for name in _ENV_RE.findall(text) if not env.get(name)})
+    text = json.dumps({k: api.get(k) for k in ("endpoint", "auth", "headers", "detail", "body")})
+    names = set(_ENV_RE.findall(text))
+    auth = api.get("auth") or {}
+    if auth.get("type") == "sdk" and auth.get("env"):
+        names.add(str(auth["env"]))         # a key the SDK reads itself
+    return sorted({name for name in names if not env.get(name)})
 
 
 def available_apis(spec: Mapping[str, Any], env: Optional[Mapping[str, str]] = None
@@ -271,6 +289,8 @@ def field_value(rule: str, hit: Any, root: Any = None) -> Any:
         return rule[len("const:"):]
     if rule.startswith("template:"):
         return _expand(rule[len("template:"):], hit, root)
+    if rule.startswith("root:"):
+        return get_path(root, rule[len("root:"):])
     return get_path(hit, rule)
 
 
@@ -325,6 +345,12 @@ def hit_from(api: Mapping[str, Any], hit: Any, root: Any = None, query: str = ""
 
     def get(name: str) -> Any:
         rule = fields.get(name)
+        if isinstance(rule, list):          # the first rule that gives a value
+            for one in rule:
+                value = field_value(one, hit, root)
+                if value not in (None, "", []):
+                    return value
+            return None
         return field_value(rule, hit, root) if rule else None
 
     image_url = _text(get("image_url"))
@@ -383,10 +409,28 @@ def _headers(api: Mapping[str, Any], env: Mapping[str, str]) -> Dict[str, str]:
     return headers
 
 
+_SSL_CONTEXT = None
+
+
+def ssl_context():
+    """HTTPS verified with certifi's bundle when it is installed: Python's
+    own store misses intermediates some image CDNs rely on (bunny.net's
+    b-cdn.net failed with CERTIFICATE_VERIFY_FAILED)."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        import ssl
+        try:
+            import certifi
+            _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+        except Exception:  # noqa: BLE001 - the system's store then
+            _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
+
+
 def http_get_json(url: str, headers: Mapping[str, str], timeout: float) -> Any:
     """GET ``url`` and parse its JSON (the default transport)."""
     request = urllib.request.Request(url, headers=dict(headers))
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=ssl_context()) as response:
         return json.loads(response.read().decode("utf-8", errors="replace"))
 
 
@@ -463,7 +507,14 @@ def search(spec: Mapping[str, Any], queries: Sequence[str], limit: int = DEFAULT
                         "left out", len(jobs) - len(found), len(jobs), deadline_s)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    lists = [found.get(i, []) for i in range(len(jobs))]
+    merged = _interleave([found.get(i, []) for i in range(len(jobs))])
+    log.info("image_search - %d image(s) from %d API(s) for %d query(ies)",
+             len(merged), len(apis), len(queries))
+    return merged
+
+
+def _interleave(lists: Sequence[Sequence[ImageHit]]) -> List[ImageHit]:
+    """The hits of several lists, rank by rank, without a picture or page twice."""
     merged: List[ImageHit] = []
     seen = set()
     for rank in range(max((len(l) for l in lists), default=0)):
@@ -476,9 +527,329 @@ def search(spec: Mapping[str, Any], queries: Sequence[str], limit: int = DEFAULT
                 continue
             seen |= keys
             merged.append(hit)
-    log.info("image_search - %d image(s) from %d API(s) for %d query(ies)",
-             len(merged), len(apis), len(queries))
     return merged
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Reverse image search: an image in, where it appears and images like it out
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: The spec's list of reverse engines - apart from ``apis``, so a text search
+#: never sends a query to an engine that takes an image.
+REVERSE_KEY = "reverse_apis"
+
+#: The ``kind`` of the reverse entry that has a model describe the image and
+#: the text APIs search the description (no endpoint).
+DESCRIBE_KIND = "describe_then_search"
+
+#: The model the describe entry uses when it names none.
+DESCRIBE_MODEL = "claude-opus-5-5"
+
+DESCRIBE_PROMPT = ("Write the web image search query, at most 8 words, most likely to find this "
+                   "exact image or images very like it. If you recognise a known work, place or "
+                   "person, name it. Reply with the query only.")
+
+
+def http_post_json(url: str, headers: Mapping[str, str], body: Any, timeout: float) -> Any:
+    """POST ``body`` as JSON to ``url`` and parse the JSON answer."""
+    request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
+                                     headers={**dict(headers), "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout, context=ssl_context()) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def _fill_body(node: Any, values: Mapping[str, Any]) -> Any:
+    """A JSON body template filled: a string that is exactly ``{name}`` takes
+    the value itself (a number stays a number), others have it replaced in."""
+    if isinstance(node, dict):
+        return {k: _fill_body(v, values) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_fill_body(v, values) for v in node]
+    if isinstance(node, str):
+        for name, value in values.items():
+            if node == "{" + name + "}":
+                return value
+        for name, value in values.items():
+            node = node.replace("{" + name + "}", str(value))
+    return node
+
+
+#: SerpApi's Image API takes at most 500 KB (JPEG, PNG or WebP).
+UPLOAD_MAX_BYTES = 500 * 1000
+_UPLOAD_MIME = ("image/jpeg", "image/png", "image/webp")
+
+
+def http_post_form(url: str, headers: Mapping[str, str], fields: Mapping[str, str],
+                   file_field: str, filename: str, data: bytes, mime: str, timeout: float) -> Any:
+    """POST a multipart form (``fields`` and one file) and parse the JSON answer."""
+    import uuid
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in fields.items():
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                      f"{value}\r\n").encode("utf-8"))
+    parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+                  f'filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n').encode("utf-8")
+                 + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    request = urllib.request.Request(
+        url, data=b"".join(parts), method="POST",
+        headers={**dict(headers), "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(request, timeout=timeout, context=ssl_context()) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def fit_upload(data: bytes, max_bytes: int = UPLOAD_MAX_BYTES) -> Optional[tuple]:
+    """``(bytes, mime)`` of the picture within ``max_bytes`` as JPEG, PNG or
+    WebP: as is when it already fits, else a JPEG made smaller until it does
+    (Pillow). ``None`` when it cannot be made to fit."""
+    mime = _sniff(data)
+    if mime in _UPLOAD_MIME and len(data) <= max_bytes:
+        return data, mime
+    import io
+    try:
+        from PIL import Image
+        image = Image.open(io.BytesIO(data))
+        image.load()
+    except Exception as exc:  # noqa: BLE001 - not a picture, or no Pillow
+        log.info("image_search - cannot fit the picture for an upload: %s", exc)
+        return None
+    image = image.convert("RGB")
+    side = max(image.size)
+    for quality, scale in ((85, 1.0), (80, 0.75), (75, 0.5), (70, 0.35), (65, 0.25)):
+        copy = image
+        if scale < 1.0 and side * scale > 256:
+            copy = image.copy()
+            copy.thumbnail((int(side * scale), int(side * scale)))
+        out = io.BytesIO()
+        copy.save(out, format="JPEG", quality=quality, optimize=True)
+        if out.tell() <= max_bytes:
+            return out.getvalue(), "image/jpeg"
+    return None
+
+
+def upload_image(api: Mapping[str, Any], image_bytes: bytes, env: Mapping[str, str],
+                 timeout: float, post_form: Callable[..., Any] = http_post_form) -> str:
+    """Upload the picture as the engine's ``upload`` block says; the id its
+    answer gives (``id``, a path in it). Raises on any failure."""
+    upload = api["upload"]
+    fitted = fit_upload(image_bytes, int(upload.get("max_bytes") or UPLOAD_MAX_BYTES))
+    if fitted is None:
+        raise ValueError("the picture cannot be made small enough to upload")
+    data, mime = fitted
+    fields = {str(k): _fill(str(v), env) for k, v in (upload.get("fields") or {}).items()}
+    answer = post_form(_fill(str(upload["url"]), env), _headers(api, env), fields,
+                       str(upload.get("file_field") or "image"),
+                       "image" + {"image/png": ".png", "image/webp": ".webp"}.get(mime, ".jpg"),
+                       data, mime, timeout)
+    if isinstance(answer, dict) and answer.get("error"):
+        raise ValueError(f"upload refused: {answer['error']}")
+    image_id = get_path(answer, str(upload.get("id") or "image_id"))
+    if not image_id:
+        raise ValueError(f"the upload answer has no {upload.get('id') or 'image_id'}")
+    return str(image_id)
+
+
+def _uploads(api: Mapping[str, Any]) -> bool:
+    upload = api.get("upload")
+    return isinstance(upload, dict) and bool(upload.get("url")) and bool(upload.get("search"))
+
+
+def _result_sets(api: Mapping[str, Any]) -> List[tuple]:
+    """``(results path, fields)`` of every list of hits an answer holds: an
+    entry's ``result_sets``, else its ``results`` + ``fields``."""
+    sets = api.get("result_sets")
+    if isinstance(sets, list) and sets:
+        return [(str(s.get("results") or ""), s.get("fields") or {})
+                for s in sets if isinstance(s, dict)]
+    return [(str(api.get("results") or ""), api.get("fields") or {})]
+
+
+def available_reverse_apis(spec: Mapping[str, Any], image_url: str = "",
+                           has_bytes: bool = False,
+                           env: Optional[Mapping[str, str]] = None) -> List[Dict[str, Any]]:
+    """The reverse engines that can run on this image now: enabled, their keys
+    set, and given what they take (``input``: ``url``, a public image URL;
+    ``bytes``, the file itself - which can be read from the URL too; a
+    ``url`` engine with an ``upload`` block takes the file too). The
+    describe entry is not among them: it is the fallback."""
+    env = os.environ if env is None else env
+    out = []
+    for api in spec.get(REVERSE_KEY) or []:
+        if not isinstance(api, dict) or not api.get("enabled", False) or not api.get("endpoint"):
+            continue
+        needs = str(api.get("input") or "url")
+        if needs == "url" and not image_url and not (has_bytes and _uploads(api)):
+            continue
+        if needs == "bytes" and not (has_bytes or image_url):
+            continue
+        missing = missing_keys(api, env)
+        if missing:
+            log.info("image_search - reverse '%s' skipped: %s not set",
+                     api.get("name"), ", ".join(missing))
+            continue
+        out.append(api)
+    return out
+
+
+def describe_entry(spec: Mapping[str, Any], env: Optional[Mapping[str, str]] = None
+                   ) -> Optional[Dict[str, Any]]:
+    """The enabled describe-then-search entry, when its key is set."""
+    env = os.environ if env is None else env
+    for api in spec.get(REVERSE_KEY) or []:
+        if isinstance(api, dict) and api.get("kind") == DESCRIBE_KIND and api.get("enabled", False):
+            return None if missing_keys(api, env) else api
+    return None
+
+
+def reverse_search_api(api: Mapping[str, Any], image_url: str = "",
+                       image_bytes: Optional[bytes] = None, limit: int = DEFAULT_LIMIT,
+                       env: Optional[Mapping[str, str]] = None,
+                       fetch_json: Callable[[str, Mapping[str, str], float], Any] = http_get_json,
+                       post_json: Callable[[str, Mapping[str, str], Any, float], Any] = http_post_json,
+                       post_form: Callable[..., Any] = http_post_form
+                       ) -> List[ImageHit]:
+    """What one reverse engine finds for the image; ``[]`` on any failure.
+    A ``url`` engine fills ``{image_url}`` in its endpoint - or, without a
+    public URL, uploads the file (its ``upload`` block) and fills
+    ``{image_id}`` in the block's ``search`` endpoint; a ``bytes`` engine
+    POSTs its ``body`` with ``{image_base64}`` and ``{limit}`` filled in."""
+    import base64
+    env = os.environ if env is None else env
+    name = api.get("name") or "?"
+    timeout = float(api.get("timeout_s") or DEFAULT_TIMEOUT)
+    headers = _headers(api, env)
+    try:
+        if str(api.get("input") or "url") == "bytes":
+            if image_bytes is None:
+                fetched = fetch_image(image_url, timeout) if image_url else None
+                if fetched is None:
+                    log.info("image_search - reverse '%s': no image bytes", name)
+                    return []
+                image_bytes = fetched[0]
+            url = _fill(str(api["endpoint"]), env)
+            body = _fill_body(api.get("body") or {}, {
+                "image_base64": base64.standard_b64encode(image_bytes).decode("ascii"),
+                "limit": int(limit)})
+            root = post_json(url, headers, body, timeout)
+        elif not image_url and image_bytes is not None and _uploads(api):
+            image_id = upload_image(api, image_bytes, env, timeout, post_form)
+            url = _fill(str(api["upload"]["search"]), env,
+                        image_id=urllib.parse.quote(image_id, safe=""), limit=str(int(limit)))
+            root = fetch_json(url, headers, timeout)
+        elif not image_url:
+            log.info("image_search - reverse '%s': no public URL", name)
+            return []
+        else:
+            url = _fill(str(api["endpoint"]), env,
+                        image_url=urllib.parse.quote(image_url, safe=""), limit=str(int(limit)))
+            root = fetch_json(url, headers, timeout)
+    except Exception as exc:  # noqa: BLE001 - one engine down leaves the others
+        log.warning("image_search - reverse '%s' failed: %s", name, exc)
+        return []
+    lists = []
+    for path, fields in _result_sets(api):
+        raw = get_path(root, path)
+        if not isinstance(raw, list):
+            continue
+        entry = {**api, "fields": fields}
+        lists.append([h for h in (hit_from(entry, item, root, query=image_url) for item in raw)
+                      if h is not None])
+    hits = _interleave(lists)[:int(limit)]
+    log.info("image_search - reverse '%s': %d image(s)", name, len(hits))
+    return hits
+
+
+def claude_describer(model: str = DESCRIBE_MODEL) -> Callable[[bytes, str], str]:
+    """``(image bytes, mime) -> query``: Claude looks at the picture and
+    writes the image search that would find it (``ANTHROPIC_API_KEY``)."""
+    def describe(data: bytes, mime: str) -> str:
+        import base64
+        import anthropic
+        response = anthropic.Anthropic().beta.messages.create(
+            model=model, max_tokens=1024,
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+            output_config={"effort": "low"},
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": mime,
+                                             "data": base64.standard_b64encode(data).decode("ascii")}},
+                {"type": "text", "text": DESCRIBE_PROMPT}]}])
+        if response.stop_reason == "refusal":
+            raise ValueError("Claude declined to describe the image")
+        return "".join(b.text for b in response.content if b.type == "text").strip().strip('"')
+    return describe
+
+
+def _ask_reverse(apis: Sequence[Mapping[str, Any]], image_url: str,
+                 image_bytes: Optional[bytes], limit: int, env: Mapping[str, str],
+                 deadline_s: float, fetch_json, post_json, post_form) -> List[ImageHit]:
+    """The reverse engines ``apis`` asked at once, their hits interleaved."""
+    if not apis:
+        return []
+    lists: List[List[ImageHit]] = []
+    with ThreadPoolExecutor(max_workers=len(apis), thread_name_prefix="reverse-search") as pool:
+        futures = [pool.submit(reverse_search_api, api, image_url, image_bytes, limit, env,
+                               fetch_json, post_json, post_form) for api in apis]
+        for future in futures:
+            try:
+                lists.append(future.result(timeout=deadline_s))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("image_search - a reverse search failed: %s", exc)
+    return _interleave(lists)
+
+
+def reverse_search(spec: Mapping[str, Any], image_url: str = "",
+                   image_bytes: Optional[bytes] = None, limit: int = DEFAULT_LIMIT,
+                   env: Optional[Mapping[str, str]] = None, deadline_s: float = 60.0,
+                   describe: Optional[Callable[[bytes, str], str]] = None,
+                   fetch_json: Callable[[str, Mapping[str, str], float], Any] = http_get_json,
+                   post_json: Callable[[str, Mapping[str, str], Any, float], Any] = http_post_json,
+                   post_form: Callable[..., Any] = http_post_form
+                   ) -> List[ImageHit]:
+    """Where an image appears and the images like it: every reverse engine
+    that can take it as it is (its public ``image_url``, its ``image_bytes``,
+    or both) asked at once, the hits interleaved. Uploading the file to an
+    engine (a ``url`` engine's ``upload`` block, for a picture without a
+    public URL) is the first fallback: only when those engines are not
+    configured or find nothing, since the file then leaves for the engine's
+    servers and costs an upload. When nothing finds anything, the describe
+    entry - Claude, or ``describe`` - turns the picture into a query the text
+    APIs of ``apis`` search (similar images, not every copy)."""
+    env = os.environ if env is None else env
+    apis = available_reverse_apis(spec, image_url, image_bytes is not None, env)
+    uploads = [api for api in apis if str(api.get("input") or "url") == "url" and not image_url]
+    direct = [api for api in apis if api not in uploads]
+    for engines in (direct, uploads):
+        merged = _ask_reverse(engines, image_url, image_bytes, limit, env, deadline_s,
+                              fetch_json, post_json, post_form)
+        if merged:
+            log.info("image_search - reverse: %d image(s) from %s", len(merged),
+                     ", ".join(str(api.get("name")) for api in engines))
+            return merged
+        if engines is direct and uploads:
+            log.info("image_search - reverse: %s, so the file is uploaded to %s",
+                     "nothing found" if direct else "no engine takes the file as it is",
+                     ", ".join(str(api.get("name")) for api in uploads))
+    entry = describe_entry(spec, env)
+    if describe is None and entry is not None:
+        describe = claude_describer(str(entry.get("model") or DESCRIBE_MODEL))
+    if describe is None:
+        log.info("image_search - reverse: no engine for this image")
+        return []
+    data = image_bytes
+    if data is None and image_url:
+        fetched = fetch_image(image_url)
+        data = fetched[0] if fetched else None
+    if data is None:
+        return []
+    try:
+        query = describe(data, _sniff(data) or "image/jpeg")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("image_search - describing the image failed: %s", exc)
+        return []
+    log.info("image_search - reverse: described as %r", query)
+    return search(spec, [query], limit=limit, env=env, deadline_s=deadline_s,
+                  fetch_json=fetch_json)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -513,14 +884,16 @@ def _strings(value: Any) -> List[str]:
 
 def queries_for(profile: Optional[Mapping[str, Any]] = None, prompt: str = "",
                 liked: Iterable[str] = (), n: int = 3) -> List[str]:
-    """The searches that find images for a persona: what was typed first;
-    then what its relation agent learned it likes (the tags, genres and
-    titles of the images it liked); then its own words — keywords, likes,
-    intention, prompt. At most ``n``, short, no repeat."""
+    """The searches that find images for a persona: what was typed first,
+    as it was typed - every word kept, common ones too ("Mona Lisa as modern
+    art" is not "Mona Lisa modern art"); then what its relation agent learned
+    it likes (the tags, genres and titles of the images it liked); then its
+    own words — keywords, likes, intention, prompt —, those cut short. At
+    most ``n``, no repeat."""
     profile = profile or {}
     candidates: List[str] = []
     if str(prompt or "").strip():
-        candidates.append(short_query(prompt, 8))
+        candidates.append(" ".join(str(prompt).split()))
     liked = [t for t in liked if str(t or "").strip()]
     if liked:
         candidates.append(short_query(" ".join(liked), 5))
@@ -549,7 +922,7 @@ def fetch_image(url: str, timeout: float = 20.0,
     ``headers`` are the image host's (an entry's ``image_headers``)."""
     try:
         request = urllib.request.Request(url, headers=dict(headers or {"User-Agent": USER_AGENT}))
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl_context()) as response:
             mime = (response.headers.get_content_type() or "").lower()
             data = response.read(MAX_IMAGE_BYTES + 1)
     except Exception as exc:  # noqa: BLE001 - the text stands in
